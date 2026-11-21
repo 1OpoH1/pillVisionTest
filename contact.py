@@ -26,54 +26,30 @@ def _points(contour: np.ndarray, limit: int = 220) -> np.ndarray:
     return points[np.round(indices).astype(np.int32)]
 
 
-def _closest_on_segment(
-    point: np.ndarray,
-    start: np.ndarray,
-    end: np.ndarray,
-) -> Tuple[np.ndarray, float]:
-    segment = end - start
-    length_sq = float(np.dot(segment, segment))
-    if length_sq <= 1e-9:
-        delta = point - start
-        return start, float(np.dot(delta, delta))
-    t = float(np.clip(np.dot(point - start, segment) / length_sq, 0.0, 1.0))
-    closest = start + t * segment
-    delta = point - closest
-    return closest, float(np.dot(delta, delta))
+def _closest_to_contour(
+    points: np.ndarray, contour: np.ndarray
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    segments = np.roll(contour, -1, axis=0) - contour
+    lengths_sq = np.einsum("ij,ij->i", segments, segments)
+    offsets = points[:, None, :] - contour
+    projections = np.einsum("ijk,jk->ij", offsets, segments)
+    fractions = np.clip(projections / np.where(lengths_sq > 1e-9, lengths_sq, 1.0), 0.0, 1.0)
+    closest = contour + fractions[..., None] * segments
+    delta = points[:, None, :] - closest
+    distances_sq = np.einsum("ijk,ijk->ij", delta, delta)
+    point_index, segment_index = np.unravel_index(distances_sq.argmin(), distances_sq.shape)
+    return float(distances_sq[point_index, segment_index]), points[point_index], closest[point_index, segment_index]
 
 
 def _min_distance(
     points_a: np.ndarray,
     points_b: np.ndarray,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
-    best_distance = float("inf")
-    best_a = points_a[0]
-    best_b = points_b[0]
-    count_b = len(points_b)
-    for point in points_a:
-        for index in range(count_b):
-            closest, distance_sq = _closest_on_segment(
-                point,
-                points_b[index],
-                points_b[(index + 1) % count_b],
-            )
-            if distance_sq < best_distance:
-                best_distance = distance_sq
-                best_a = point
-                best_b = closest
-    count_a = len(points_a)
-    for point in points_b:
-        for index in range(count_a):
-            closest, distance_sq = _closest_on_segment(
-                point,
-                points_a[index],
-                points_a[(index + 1) % count_a],
-            )
-            if distance_sq < best_distance:
-                best_distance = distance_sq
-                best_a = closest
-                best_b = point
-    return float(np.sqrt(best_distance)), best_a, best_b
+    forward, point_a, closest_b = _closest_to_contour(points_a, points_b)
+    reverse, point_b, closest_a = _closest_to_contour(points_b, points_a)
+    if reverse < forward:
+        return float(np.sqrt(reverse)), closest_a, point_b
+    return float(np.sqrt(forward)), point_a, closest_b
 
 
 def _bbox_gap(a: Instance, b: Instance) -> float:

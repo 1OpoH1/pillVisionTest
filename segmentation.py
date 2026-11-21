@@ -70,7 +70,8 @@ class Segmenter:
         return lab, chroma, gray
 
     def _get_background(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._background_arrays is None or self._background_image is None:
+        if (self._background_arrays is None or self._background_image is None
+                or self._background_arrays[0].shape[:2] != frame.shape[:2]):
             self._background_arrays = self._prepare_background(frame)
         return self._background_arrays
 
@@ -111,9 +112,7 @@ class Segmenter:
                 cv2.drawContours(filled, contours, -1, 255, -1)
             mask_u8 = filled
 
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-        clean = np.zeros_like(mask_u8)
-        for index in range(1, count):
-            if stats[index, cv2.CC_STAT_AREA] >= self.config.min_area:
-                clean[labels == index] = 255
-        return clean
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+        keep = (stats[:, cv2.CC_STAT_AREA] >= self.config.min_area).astype(np.uint8) * 255
+        keep[0] = 0
+        return keep[labels]

@@ -81,7 +81,7 @@ def _h_maxima(dist: np.ndarray, height: float, config: Config) -> np.ndarray:
     for _ in range(config.peak_reconstruction_iterations):
         expanded = cv2.dilate(reconstructed, kernel)
         updated = np.minimum(expanded, dist)
-        if float(np.max(np.abs(updated - reconstructed))) < 1e-3:
+        if cv2.norm(updated, reconstructed, cv2.NORM_INF) < 1e-3:
             reconstructed = updated
             break
         reconstructed = updated
@@ -98,19 +98,19 @@ def _find_peaks(dist: np.ndarray, config: Config) -> List[Tuple[int, int, float]
     height = max(config.peak_min_absolute, config.peak_h_ratio * max_distance)
     maxima = _h_maxima(smooth, height, config)
     peak_mask = (maxima > 1e-3).astype(np.uint8)
-    count, labels, _, _ = cv2.connectedComponentsWithStats(peak_mask, connectivity=8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(peak_mask, connectivity=8)
     minimum_value = max(config.peak_min_absolute, config.peak_min_ratio * max_distance)
     peaks: List[Tuple[int, int, float]] = []
     for label in range(1, count):
-        ys, xs = np.where(labels == label)
-        if len(xs) == 0:
-            continue
-        values = dist[ys, xs]
+        x, y, width, height, _ = stats[label]
+        region = np.s_[y:y + height, x:x + width]
+        ys, xs = np.where(labels[region] == label)
+        values = dist[region][ys, xs]
         index = int(np.argmax(values))
         value = float(values[index])
         if value < minimum_value:
             continue
-        peaks.append((int(xs[index]), int(ys[index]), value))
+        peaks.append((int(x + xs[index]), int(y + ys[index]), value))
     peaks.sort(key=lambda item: item[2], reverse=True)
     return peaks[: config.peak_max_count]
 
@@ -256,18 +256,20 @@ def _split_blob(local_mask: np.ndarray, local_frame: np.ndarray, config: Config)
         return [(contour, 1.0)] if contour is not None else []
     edges: List[_Edge] = []
     labels_list = list(regions.keys())
+    expanded = {
+        label: cv2.dilate(region.astype(np.uint8), kernel) > 0
+        for label, region in regions.items()
+    }
     for left_index in range(len(labels_list)):
         for right_index in range(left_index + 1, len(labels_list)):
             left = labels_list[left_index]
             right = labels_list[right_index]
-            left_u8 = regions[left].astype(np.uint8) * 255
-            right_u8 = regions[right].astype(np.uint8) * 255
-            boundary = (cv2.dilate(left_u8, kernel) > 0) & (cv2.dilate(right_u8, kernel) > 0)
+            boundary = expanded[left] & expanded[right]
             if not np.any(boundary):
                 continue
             saddle = float(dist[boundary].max())
-            left_peak = peak_values.get(left, float(dist[regions[left]].max()))
-            right_peak = peak_values.get(right, float(dist[regions[right]].max()))
+            left_peak = peak_values[left]
+            right_peak = peak_values[right]
             denominator = max(min(left_peak, right_peak), 1e-6)
             prominence = float(np.clip(1.0 - saddle / denominator, 0.0, 1.0))
             support = _gradient_support(gradient, regions[left], regions[right], boundary, config)

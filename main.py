@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import random
+from time import perf_counter
 from typing import List, Optional, Set, Tuple
 
 import cv2
@@ -13,7 +14,7 @@ from calibration import estimate_scale
 from config import Config
 from contact import Contact, find_contacts
 from segmentation import Segmenter
-from sources import create_source, parse_region
+from sources import CameraSource, create_source, parse_region
 from splitting import Instance, split_mask
 from tracking import ContactStabilizer, Tracker
 from visualize import draw_result, make_debug_views
@@ -24,6 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", choices=["image", "video", "camera", "screen"], default="camera")
     parser.add_argument("--input", type=str, default=None)
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--no-camera-tune", action="store_true",
+                        help="Открыть камеру с настройками OpenCV по умолчанию")
     parser.add_argument("--region", type=str, default=None)
     parser.add_argument("--background", type=str, default=None)
     parser.add_argument("--show", action="store_true")
@@ -229,14 +232,29 @@ def map_track_pairs(
 
 def run(args: argparse.Namespace) -> int:
     config = build_config(args)
-    source = create_source(args.source, args.input, args.camera, parse_region(args.region))
     segmenter = Segmenter(config)
     if args.background:
         background = cv2.imread(args.background, cv2.IMREAD_COLOR)
         if background is None:
-            source.release()
             raise FileNotFoundError(f"cannot read background: {args.background}")
         segmenter.set_background(background)
+
+    def detect(frame: np.ndarray) -> Tuple[np.ndarray, List[Instance], List[Contact]]:
+        mask = segmenter.foreground(frame)
+        instances = split_mask(mask, frame, config)
+        return mask, instances, find_contacts(instances, config)
+
+    def benchmark_camera(frame: np.ndarray) -> None:
+        _, instances, contacts = detect(frame)
+        if not args.no_gui or args.save_result:
+            draw_result(frame, instances, contacts)
+
+    camera_benchmark = None
+    if args.source == "camera" and not args.no_camera_tune:
+        print("Подбор режима камеры…", flush=True)
+        camera_benchmark = benchmark_camera
+    source = create_source(args.source, args.input, args.camera, parse_region(args.region),
+                           camera_benchmark)
 
     tracker: Optional[Tracker] = Tracker() if source.is_live else None
     stabilizer = ContactStabilizer(config) if source.is_live else None
@@ -249,11 +267,14 @@ def run(args: argparse.Namespace) -> int:
     previous_contact_count = -1
 
     print(f"Источник: {source.name}")
+    if isinstance(source, CameraSource) and source.mode_info:
+        print(f"Режим камеры: {source.mode_info}")
     if source.is_live and not args.no_gui:
         print("Клавиши: q - выход, b - запомнить фон, c - сбросить фон, s - сохранить кадр")
     if args.background:
         print(f"Фон загружен: {args.background}")
 
+    started = perf_counter()
     try:
         while True:
             ok, frame = source.read()
@@ -263,9 +284,7 @@ def run(args: argparse.Namespace) -> int:
                     return 1
                 break
 
-            mask = segmenter.foreground(frame)
-            instances = split_mask(mask, frame, config)
-            raw_contacts = find_contacts(instances, config)
+            mask, instances, raw_contacts = detect(frame)
             active_contacts = raw_contacts
             active_pairs: Set[Tuple[int, int]] = set()
             track_count: Optional[int] = None
@@ -288,12 +307,10 @@ def run(args: argparse.Namespace) -> int:
 
             last_instances = instances
             last_contacts = active_contacts
-            scale = estimate_scale(instances)
-            extra = None
-            if scale is not None:
-                extra = f"median {scale.median_size:.0f}px"
-            display = draw_result(frame, instances, active_contacts, extra)
-            last_display = display
+            if not args.no_gui or args.save_result:
+                scale = estimate_scale(instances)
+                extra = f"median {scale.median_size:.0f}px" if scale is not None else None
+                last_display = draw_result(frame, instances, active_contacts, extra)
 
             count_changed = len(instances) != previous_count
             contacts_changed = len(active_contacts) != previous_contact_count
@@ -310,12 +327,12 @@ def run(args: argparse.Namespace) -> int:
                 previous_contact_count = len(active_contacts)
 
             if source.single_frame and args.save_result:
-                saved = bool(cv2.imwrite(args.save_result, display))
+                saved = bool(cv2.imwrite(args.save_result, last_display))
                 if not saved:
                     print(f"Не удалось сохранить результат: {args.save_result}")
 
             if not args.no_gui:
-                cv2.imshow("Nuts counter", display)
+                cv2.imshow("Nuts counter", last_display)
                 if args.debug:
                     for name, view in make_debug_views(frame, mask, config).items():
                         cv2.imshow(name, view)
@@ -341,7 +358,7 @@ def run(args: argparse.Namespace) -> int:
                 segmenter.clear_background()
                 print("Фон сброшен")
             if key == ord("s") and args.save_result:
-                if cv2.imwrite(args.save_result, display):
+                if cv2.imwrite(args.save_result, last_display):
                     saved = True
                     print(f"Сохранено: {args.save_result}")
                 else:
@@ -354,6 +371,8 @@ def run(args: argparse.Namespace) -> int:
 
         if source.is_live:
             print_state(frame_index, last_instances, last_contacts, source.name)
+        if isinstance(source, CameraSource):
+            print(f"Обработано {frame_index} кадров, {frame_index / (perf_counter() - started):.1f} кадр/с")
         return 0
     except KeyboardInterrupt:
         print("\nОстановлено пользователем")
